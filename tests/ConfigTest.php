@@ -14,7 +14,7 @@ use PageCache\Config;
 use PageCache\PageCache;
 use PageCache\PageCacheException;
 
-class ConfigTest extends \PHPUnit_Framework_TestCase
+class ConfigTest extends \PHPUnit\Framework\TestCase
 {
     /**
      * @var Config
@@ -135,8 +135,8 @@ class ConfigTest extends \PHPUnit_Framework_TestCase
     public function testGetLogFilePath()
     {
         $path = 'somepath/to/file';
+        $this->expectException(PageCacheException::class);
         $this->config->setLogFilePath($path);
-        $this->assertAttributeSame($path, 'logFilePath', $this->config);
     }
 
     public function testGetMinCacheFileSize()

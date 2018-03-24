@@ -11,15 +11,15 @@
 
 namespace PageCache;
 
-use PageCache\Storage\FileSystem\FileSystemCacheAdapter;
-use PageCache\Strategy\DefaultStrategy;
+use DateTime;
 use PageCache\Storage\CacheItem;
 use PageCache\Storage\CacheItemInterface;
 use PageCache\Storage\CacheItemStorage;
+use PageCache\Storage\FileSystem\FileSystemCacheAdapter;
+use PageCache\Strategy\DefaultStrategy;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
 use Psr\SimpleCache\CacheInterface;
-use DateTime;
 
 /**
  * Class PageCache
@@ -89,7 +89,7 @@ class PageCache
      *
      * @param null|string $config_file_path
      *
-     * @throws \Exception
+     * @throws \PageCache\PageCacheException
      */
     public function __construct($config_file_path = null)
     {
@@ -101,7 +101,7 @@ class PageCache
         $this->httpHeaders = new HttpHeaders();
         $this->strategy = new DefaultStrategy();
 
-        //Disable Session by default
+        // Disable Session by default
         if (!$this->config->isUseSession()) {
             SessionHandler::disable();
         }
@@ -129,17 +129,19 @@ class PageCache
             $this->log('Dry run mode is on. Live content is displayed, no cached output.');
         }
 
-        $this->log(__METHOD__.' uri:'.$_SERVER['REQUEST_URI']
-            .'; script:'.$_SERVER['SCRIPT_NAME'].'; query:'.$_SERVER['QUERY_STRING'].'.');
+        $this->log(__METHOD__ . ' uri:' . $_SERVER['REQUEST_URI']
+            . '; script:' . $_SERVER['SCRIPT_NAME'] . '; query:' . $_SERVER['QUERY_STRING'] . '.');
 
         // Search for valid cache item for current request
-        if ($item = $this->getCurrentItem()) {
+        $item = $this->getCurrentItem();
+
+        if ($item) {
             // Display cache item if found
             // If cache file not found or not valid, init() continues with cache generation(storePageContent())
             $this->displayItem($item);
         }
 
-        $this->log(__METHOD__.' Cache item not found for hash '.$this->getCurrentKey());
+        $this->log(__METHOD__ . ' Cache item not found for hash ' . $this->getCurrentKey());
 
         /**
          * Cache item not found. Fetch content, save it, display it on this run.
@@ -147,6 +149,13 @@ class PageCache
         ob_start([$this, 'storePageHandler']);
     }
 
+    /**
+     * Invoked by ob_start() to store page content
+     *
+     * @param string $content from ob_start
+     * @return string Contents of the page
+     * @throws \Psr\SimpleCache\InvalidArgumentException
+     */
     private function storePageHandler($content)
     {
         try {
@@ -164,6 +173,7 @@ class PageCache
      * Get Default Cache Adapter
      *
      * @return FileSystemCacheAdapter
+     * @throws PageCacheException
      */
     private function getDefaultCacheAdapter()
     {
@@ -195,6 +205,8 @@ class PageCache
      */
     private function displayItem(CacheItemInterface $item)
     {
+        $isDryRun = $this->config()->isDryRunMode();
+
         $this->httpHeaders
             ->setLastModified($item->getLastModified())
             ->setExpires($item->getExpiresAt())
@@ -212,17 +224,25 @@ class PageCache
                 HttpHeaders::HEADER_ETAG,
                 $item->getETagString()
             );
-            $this->log(__METHOD__.' uri:'.$_SERVER['REQUEST_URI']
+            $this->log(__METHOD__ . ' uri:' . $_SERVER['REQUEST_URI']
                 . '; Headers {' . $logHeaders . '}');
 
-            if (!$this->config()->isDryRunMode()) {
+            if (!$isDryRun) {
                 $this->httpHeaders->send();
+                $this->log(
+                    __METHOD__ . ' Headers sent: ' . PHP_EOL . implode(
+                        PHP_EOL,
+                        $this->httpHeaders->getSentHeaders()
+                    )
+                );
             }
 
+            // Check if conditions for the If-Modified-Since header are met
             if ($this->httpHeaders->checkIfNotModified()) {
-                if (!$this->config()->isDryRunMode()) {
+                if (!$isDryRun) {
                     $this->httpHeaders->sendNotModifiedHeader();
                     $this->log(__METHOD__ . ' 304 Not Modified header was set. Exiting w/o content.');
+                    $this->log(__METHOD__ . ' Response status: ' . http_response_code());
                     exit();
                 }
                 $this->log(__METHOD__ . ' 304 Not Modified header was set. Not exiting w/o content - Dry Mode.');
@@ -231,8 +251,9 @@ class PageCache
 
         // Show cached content
         $this->log(__METHOD__ . ' Cache item found: ' . $this->getCurrentKey());
+        $this->log(__METHOD__ . ' Response status: ' . http_response_code());
 
-        if (!$this->config()->isDryRunMode()) {
+        if (!$isDryRun) {
             // Echo content and stop execution
             echo $item->getContent();
             exit();
@@ -246,16 +267,17 @@ class PageCache
      * @param string $content String from ob_start
      *
      * @return string Page content
+     * @throws \Psr\SimpleCache\InvalidArgumentException
      */
     private function storePageContent($content)
     {
-        $key  = $this->getCurrentKey();
+        $key = $this->getCurrentKey();
         $item = new CacheItem($key);
 
         // When enabled we store original header values with the item
         $isHeadersForwardingEnabled = $this->config->isSendHeaders() && $this->config->isForwardHeaders();
 
-        $this->log('Header forwarding is '.($isHeadersForwardingEnabled ? 'enabled' : 'disabled'));
+        $this->log(__METHOD__ . ' Header forwarding is ' . ($isHeadersForwardingEnabled ? 'enabled' : 'disabled'));
 
         $expiresAt = $isHeadersForwardingEnabled
             ? $this->httpHeaders->detectResponseExpires()
@@ -288,7 +310,8 @@ class PageCache
             $eTagString = md5($lastModified->getTimestamp());
         }
 
-        $item->setContent($content)
+        $item
+            ->setContent($content)
             ->setLastModified($lastModified)
             ->setETagString($eTagString);
 
@@ -334,6 +357,7 @@ class PageCache
      * @param \PageCache\Storage\CacheItemInterface|null $item
      *
      * @throws \PageCache\PageCacheException
+     * @throws \Psr\SimpleCache\InvalidArgumentException
      */
     public function clearPageCache(CacheItemInterface $item = null)
     {
@@ -344,7 +368,7 @@ class PageCache
 
         // Current item might have returned null
         if (is_null($item)) {
-            throw new PageCacheException(__METHOD__.' Page cache item can not be detected');
+            throw new PageCacheException(__METHOD__ . ' Page cache item can not be detected');
         }
 
         $this->getItemStorage()->delete($item);
@@ -354,6 +378,7 @@ class PageCache
      * Return current page cache as a string or false on error, if this page was cached before.
      *
      * @return string|false
+     * @throws \Psr\SimpleCache\InvalidArgumentException
      */
     public function getPageCache()
     {
@@ -369,6 +394,7 @@ class PageCache
      * @param \PageCache\Storage\CacheItemInterface|null $item
      *
      * @return bool Returns true if page has a valid cache file saved, false if not
+     * @throws \Psr\SimpleCache\InvalidArgumentException
      */
     public function isCached(CacheItemInterface $item = null)
     {
@@ -403,6 +429,7 @@ class PageCache
      * Detect and return current page cached item (or null if current page was not cached yet)
      *
      * @return \PageCache\Storage\CacheItemInterface|null
+     * @throws \Psr\SimpleCache\InvalidArgumentException
      */
     private function getCurrentItem()
     {
@@ -430,15 +457,16 @@ class PageCache
      */
     public function clearAllCache()
     {
-        $this->log(__METHOD__.' Clearing all cache.');
+        $this->log(__METHOD__ . ' Clearing all cache.');
         $this->getItemStorage()->clear();
     }
 
     /**
      * Log message using PSR Logger, or error_log.
-     * Works only when logging was enabled.
+     * Works only when logging was enabled and log file path was define.
+     * Attempts to create default logger if no logger exists.
      *
-     * @param string          $msg
+     * @param string $msg Message
      * @param null|\Exception $exception
      *
      * @return bool true when logged, false when didn't log
@@ -449,14 +477,14 @@ class PageCache
             return false;
         }
 
-        // If an external logger is not available but internal logger is configured
-        if (!$this->logger && $this->config->getLogFilePath()) {
+        if (empty($this->logger) && !empty($this->config->getLogFilePath())) {
             $this->logger = new DefaultLogger($this->config->getLogFilePath());
         }
 
-        if ($this->logger) {
-            $level = $exception ? LogLevel::ALERT : LogLevel::DEBUG;
-            $this->logger->log($level, $msg, ['exception' => $exception]);
+        if ($exception) {
+            $this->logger->log(LogLevel::ALERT, $msg, ['exception' => $exception]);
+        } else {
+            $this->logger->log(LogLevel::DEBUG, $msg, []);
         }
 
         return true;
